@@ -1,0 +1,13 @@
+[project]
+name = "ml-test"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "pandas>=3.0.2",
+    "plotly>=6.6.0",
+    "pyarrow>=23.0.1",
+    "shap>=0.51.0",
+    "streamlit>=1.56.0",
+]
