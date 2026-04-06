@@ -1,5 +1,6 @@
-# Install: pip install streamlit pandas shap matplotlib plotly pyarrow
+# Install: pip install streamlit pandas shap matplotlib plotly pyarrow xgboost scikit-learn
 
+import pickle
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend required for Streamlit
 
@@ -12,64 +13,68 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PARQUET_PATH = "data/predictions"
+PARQUET_PATH   = "data/predictions"
+EXPLAINER_PATH = "models/shap_explainer.pkl"
+MODEL_PATH     = "models/xgboost_model.json"
+
+FEATURE_COLS = [
+    "login_failures",
+    "geo_anomaly_score",
+    "patch_lag_days",
+    "failed_auths",
+    "unusual_process_count",
+    "data_exfil_bytes",
+]
 
 st.set_page_config(page_title="Exposure - Machine Learning Based Sensitive Device Prediction", layout="wide")
 
 
-# ── Data Loading ──────────────────────────────────────────────────────────────
+# ── Loaders ───────────────────────────────────────────────────────────────────
+@st.cache_resource
+def load_model(model_path: str, explainer_path: str):
+    import xgboost as xgb
+    model = xgb.XGBClassifier()
+    model.load_model(model_path)
+    with open(explainer_path, "rb") as f:
+        explainer = pickle.load(f)
+    return model, explainer
+
+
 @st.cache_data
-def load_data(path: str) -> pd.DataFrame:
-    if Path(path).exists():
-        df = pd.read_parquet(path)
-        # PySpark hive-partitioned datasets encode the partition column (date=...)
-        # as a string; convert it back to datetime if needed.
-        if "date" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["date"]):
-            df["date"] = pd.to_datetime(df["date"])
-        return df
+def load_data(data_path: str, model_path: str, explainer_path: str) -> pd.DataFrame:
+    # ── Load inference parquet ────────────────────────────────────────────────
+    df = pd.read_parquet(data_path)
+    if not pd.api.types.is_datetime64_any_dtype(df["date"]):
+        df["date"] = pd.to_datetime(df["date"])
 
-    rng = np.random.default_rng(42)
-    dates = pd.date_range("2024-01-01", periods=60, freq="D")
-    tenants = ["TenantA", "TenantB", "TenantC"]
-    tenant_country = {"TenantA": "US", "TenantB": "FR", "TenantC": "FR"}
-    features = ["login_failures", "geo_anomaly_score", "patch_lag_days",
-                "failed_auths", "unusual_process_count", "data_exfil_bytes"]
-    sensitive_set = {
-        "TenantA": {f"TenantA_ap_{i:03d}" for i in range(1, 5)},
-        "TenantB": {f"TenantB_ap_{i:03d}" for i in range(1, 4)},
-        "TenantC": {f"TenantC_ap_{i:03d}" for i in range(1, 4)},
-    }
+    # ── Score with model + compute SHAP ───────────────────────────────────────
+    model, explainer = load_model(model_path, explainer_path)
+    X = df[FEATURE_COLS].values.astype(float)
 
-    rows = []
-    for tenant in tenants:
-        for i in range(1, 13):
-            device = f"{tenant}_ap_{i:03d}"
-            is_sensitive = device in sensitive_set[tenant]
-            for date in dates:
-                score = float(rng.beta(30, 5) if is_sensitive else rng.beta(2, 20))
-                shap_vals = rng.normal(0, 0.06, len(features))
-                row = {
-                    "date": date,
-                    "tenant_id": tenant,
-                    "country": tenant_country[tenant],
-                    "ap_serial": device,
-                    "prediction_score": score,
-                    "shap_base_value": 0.15,
-                }
-                for feat, sv in zip(features, shap_vals):
-                    row[f"shap_{feat}"] = float(sv)
-                    row[feat] = float(abs(rng.normal(sv * 10, 1)))
-                rows.append(row)
+    df["prediction_score"] = model.predict_proba(X)[:, 1]
 
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"])
+    shap_values = explainer.shap_values(X)
+    # shap_values is a list [class0, class1] for binary classifiers
+    sv = shap_values[1] if isinstance(shap_values, list) else shap_values
+    df["shap_base_value"] = float(explainer.expected_value[1]
+                                  if isinstance(explainer.expected_value, np.ndarray)
+                                  else explainer.expected_value)
+    for i, feat in enumerate(FEATURE_COLS):
+        df[f"shap_{feat}"] = sv[:, i]
+
     return df
 
 
-df_all = load_data(PARQUET_PATH)
+if not Path(EXPLAINER_PATH).exists() or not Path(MODEL_PATH).exists():
+    st.error(
+        "No trained model found. Run `python train.py` first to train and save the model."
+    )
+    st.stop()
 
-shap_cols = [c for c in df_all.columns if c.startswith("shap_") and c != "shap_base_value"]
-feature_cols = [c.replace("shap_", "") for c in shap_cols]
+df_all = load_data(PARQUET_PATH, MODEL_PATH, EXPLAINER_PATH)
+
+shap_cols    = [f"shap_{f}" for f in FEATURE_COLS]
+feature_cols = FEATURE_COLS
 
 
 # ── Sidebar Filters ───────────────────────────────────────────────────────────
@@ -113,16 +118,11 @@ with tab_overview:
         non_sensitive_devices = len(all_aps - sensitive_aps)
         pct_sensitive = (sensitive_devices / total_devices * 100) if total_devices > 0 else 0.0
 
-        latest_date = df_base["date"].max()
-        sensitive_latest = df_base[
-            (df_base["date"] == latest_date) & (df_base["prediction_score"] >= threshold)
-        ]["ap_serial"].nunique()
-
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Sensitive", sensitive_latest, help=f"Devices above threshold on {latest_date.date()}")
-        col2.metric("Total Sensitive Devices", sensitive_devices)
-        col3.metric("Total Non-Sensitive Devices", non_sensitive_devices)
-        col4.metric("% Sensitive Devices", f"{pct_sensitive:.1f}%")
+        col1.metric("Total Devices",         total_devices)
+        col2.metric("Sensitive Devices",     sensitive_devices)
+        col3.metric("Non-Sensitive Devices", non_sensitive_devices)
+        col4.metric("% Sensitive",           f"{pct_sensitive:.1f}%")
 
         if df.empty:
             st.info("No devices above threshold — adjust the slider to see charts.")
@@ -137,27 +137,29 @@ with tab_overview:
                 px.bar(daily, x="date", y="pct_sensitive", color="avg_score",
                        color_continuous_scale="RdYlGn_r",
                        title="% Devices Predicted as Sensitive per Day",
-                       labels={"pct_sensitive": "% Sensitive Devices", "avg_score": "Avg Score"}),
+                       labels={"pct_sensitive": "% Sensitive Devices", "avg_score": "Avg Sensitivity Score"}),
                 use_container_width=True,
             )
             st.markdown("Distribution of threat scores across tenants for devices above the threshold. The box shows the interquartile range; the line is the median. Wider spreads indicate more variability in risk within that tenant.")
             st.plotly_chart(
                 px.box(df, x="tenant_id", y="prediction_score", color="tenant_id",
-                       title="Score Distribution by Tenant",
-                       labels={"tenant_id": "Tenant", "prediction_score": "Score"}),
+                       title="Sensitivity Score Distribution by Tenant (Sensitive Devices Only)",
+                       labels={"tenant_id": "Tenant", "prediction_score": "Sensitivity Score"}),
                 use_container_width=True,
             )
             st.markdown("Same score distribution broken down by country. Use this to spot whether threat activity is concentrated in a particular region.")
             st.plotly_chart(
                 px.box(df, x="country", y="prediction_score", color="country",
-                       title="Score Distribution by Country",
-                       labels={"country": "Country", "prediction_score": "Score"}),
+                       title="Sensitivity Score Distribution by Country (Sensitive Devices Only)",
+                       labels={"country": "Country", "prediction_score": "Sensitivity Score"}),
                 use_container_width=True,
             )
             st.subheader("Top 20 Highest-Risk Devices")
             st.markdown("Devices with the highest individual prediction scores within the selected filters. Use this to prioritise which devices to investigate first.")
             st.dataframe(
                 df.nlargest(20, "prediction_score")[["date", "tenant_id", "ap_serial", "prediction_score"]]
+                  .rename(columns={"date": "Date", "tenant_id": "Tenant",
+                                   "ap_serial": "AP Serial", "prediction_score": "Sensitivity Score"})
                   .reset_index(drop=True),
                 use_container_width=True,
             )
@@ -174,11 +176,17 @@ with tab_device:
         st.markdown("Track how the sensitivity score for a single device evolves over time. A rising trend may indicate increasing exposure or deteriorating security posture.")
         st.plotly_chart(
             px.line(dev_df, x="date", y="prediction_score", markers=True,
-                    title=f"Score Over Time — {sel_device}"),
+                    title=f"Sensitivity Score Over Time — {sel_device}",
+                    labels={"date": "Date", "prediction_score": "Sensitivity Score"}),
             use_container_width=True,
         )
         st.markdown("Full record for this device across the selected date range, including all raw feature values and SHAP contributions used by the model.")
-        st.dataframe(dev_df.reset_index(drop=True), use_container_width=True)
+        st.dataframe(
+            dev_df.rename(columns={"date": "Date", "tenant_id": "Tenant",
+                                   "ap_serial": "AP Serial", "prediction_score": "Sensitivity Score"})
+                  .reset_index(drop=True),
+            use_container_width=True,
+        )
 
 
 # ── Tab 3: SHAP Global ────────────────────────────────────────────────────────
@@ -194,7 +202,7 @@ with tab_shap_global:
         st.plotly_chart(
             px.bar(x=mean_shap.values, y=mean_shap.index, orientation="h",
                    title="Mean |SHAP| — Feature Importance",
-                   labels={"x": "Mean |SHAP|", "y": "Feature"}),
+                   labels={"x": "Mean |SHAP Value|", "y": "Feature"}),
             use_container_width=True,
         )
 
@@ -210,6 +218,19 @@ with tab_shap_global:
         fig_bee = plt.gcf()
         st.pyplot(fig_bee, bbox_inches="tight")
         plt.close(fig_bee)
+
+        st.subheader("SHAP Violin Plot")
+        st.markdown("Shows the distribution of SHAP values per feature as violins. A wide violin means the feature's impact varies greatly across devices; a narrow one means it contributes consistently. Color indicates the feature value — red means high, blue means low.")
+        shap.summary_plot(
+            df[shap_cols].values.astype(float),
+            df[feature_cols].values.astype(float),
+            feature_names=feature_cols,
+            plot_type="violin",
+            show=False,
+        )
+        fig_violin = plt.gcf()
+        st.pyplot(fig_violin, bbox_inches="tight")
+        plt.close(fig_violin)
 
 
 # ── Tab 4: SHAP per Device ────────────────────────────────────────────────────
@@ -230,7 +251,7 @@ with tab_shap_device:
             st.warning("No record found for this device/date combination.")
         else:
             row = row_df.iloc[0]
-            st.metric("Prediction Score", f"{row['prediction_score']:.4f}")
+            st.metric("Sensitivity Score", f"{row['prediction_score']:.4f}")
             st.markdown("This waterfall chart breaks down exactly why the model assigned this score to the selected device on this date. Each bar shows how much a specific feature pushed the score up (red) or down (blue) from the baseline. The final value on the right is the resulting prediction score.")
             explanation_single = shap.Explanation(
                 values=row[shap_cols].values.astype(float),
