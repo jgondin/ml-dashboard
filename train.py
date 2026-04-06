@@ -16,7 +16,6 @@ Usage:
 import pickle
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import shap
 import xgboost as xgb

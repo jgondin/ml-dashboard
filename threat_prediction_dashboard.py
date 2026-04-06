@@ -54,11 +54,9 @@ def load_data(data_path: str, model_path: str, explainer_path: str) -> pd.DataFr
     df["prediction_score"] = model.predict_proba(X)[:, 1]
 
     shap_values = explainer.shap_values(X)
-    # shap_values is a list [class0, class1] for binary classifiers
+    # TreeExplainer returns [class0, class1] for binary classifiers
     sv = shap_values[1] if isinstance(shap_values, list) else shap_values
-    df["shap_base_value"] = float(explainer.expected_value[1]
-                                  if isinstance(explainer.expected_value, np.ndarray)
-                                  else explainer.expected_value)
+    df["shap_base_value"] = float(np.atleast_1d(explainer.expected_value)[-1])
     for i, feat in enumerate(FEATURE_COLS):
         df[f"shap_{feat}"] = sv[:, i]
 
@@ -73,8 +71,7 @@ if not Path(EXPLAINER_PATH).exists() or not Path(MODEL_PATH).exists():
 
 df_all = load_data(PARQUET_PATH, MODEL_PATH, EXPLAINER_PATH)
 
-shap_cols    = [f"shap_{f}" for f in FEATURE_COLS]
-feature_cols = FEATURE_COLS
+shap_cols = [f"shap_{f}" for f in FEATURE_COLS]
 
 
 # ── Sidebar Filters ───────────────────────────────────────────────────────────
@@ -88,6 +85,9 @@ countries = st.sidebar.multiselect("Country", sorted(df_all["country"].unique())
                                     default=sorted(df_all["country"].unique()))
 threshold = st.sidebar.slider("Threshold", 0.0, 1.0, 0.5, 0.01)
 
+if not date_range:
+    st.warning("Please select a date range.")
+    st.stop()
 start, end = (date_range[0], date_range[1]) if len(date_range) == 2 else (date_range[0], date_range[0])
 df_base = df_all[
     (df_all["date"].dt.date >= start) & (df_all["date"].dt.date <= end) &
@@ -98,6 +98,9 @@ df_base = df_all[
 df = df_base[df_base["prediction_score"] >= threshold].copy()
 
 st.sidebar.metric("Filtered records", len(df_base))
+
+# ── Derived ───────────────────────────────────────────────────────────────────
+devices = sorted(df["ap_serial"].unique()) if not df.empty else []
 
 # ── Main Layout ───────────────────────────────────────────────────────────────
 st.title("Exposure - Machine Learning Based Sensitive Device Prediction")
@@ -167,7 +170,6 @@ with tab_overview:
 
 # ── Tab 2: Device Drill-down ──────────────────────────────────────────────────
 with tab_device:
-    devices = sorted(df["ap_serial"].unique()) if not df.empty else []
     if not devices:
         st.warning("No devices match current filters.")
     else:
@@ -195,7 +197,7 @@ with tab_shap_global:
         st.warning("Need at least 2 records for global SHAP plots.")
     else:
         mean_shap = df[shap_cols].abs().mean()
-        mean_shap.index = feature_cols
+        mean_shap.index = FEATURE_COLS
         mean_shap = mean_shap.sort_values()
 
         st.markdown("Average absolute SHAP value per feature across all sensitive devices. Longer bars indicate features that have the most influence on the model's predictions — these are the key drivers of exposure risk.")
@@ -206,25 +208,13 @@ with tab_shap_global:
             use_container_width=True,
         )
 
-        st.subheader("SHAP Beeswarm Plot")
-        st.markdown("Each dot represents one device-day observation. Dots to the right (positive SHAP) push the score higher; dots to the left lower it. Color shows the feature value — red means high, blue means low. This reveals both the direction and magnitude of each feature's impact across the entire dataset.")
-        explanation = shap.Explanation(
-            values=df[shap_cols].values.astype(float),
-            base_values=df["shap_base_value"].values.astype(float),
-            data=df[feature_cols].values.astype(float),
-            feature_names=feature_cols,
-        )
-        shap.plots.beeswarm(explanation, show=False, max_display=len(feature_cols))
-        fig_bee = plt.gcf()
-        st.pyplot(fig_bee, bbox_inches="tight")
-        plt.close(fig_bee)
-
         st.subheader("SHAP Violin Plot")
         st.markdown("Shows the distribution of SHAP values per feature as violins. A wide violin means the feature's impact varies greatly across devices; a narrow one means it contributes consistently. Color indicates the feature value — red means high, blue means low.")
+        plt.figure(figsize=(8, max(6, len(FEATURE_COLS) * 1.2)))
         shap.summary_plot(
             df[shap_cols].values.astype(float),
-            df[feature_cols].values.astype(float),
-            feature_names=feature_cols,
+            df[FEATURE_COLS].values.astype(float),
+            feature_names=FEATURE_COLS,
             plot_type="violin",
             show=False,
         )
@@ -235,13 +225,12 @@ with tab_shap_global:
 
 # ── Tab 4: SHAP per Device ────────────────────────────────────────────────────
 with tab_shap_device:
-    devices4 = sorted(df["ap_serial"].unique()) if not df.empty else []
-    if not devices4:
+    if not devices:
         st.warning("No devices match current filters.")
     else:
         col1, col2 = st.columns(2)
         with col1:
-            sel_dev4 = st.selectbox("Select Device", devices4, key="shap_dev")
+            sel_dev4 = st.selectbox("Select Device", devices, key="shap_dev")
         with col2:
             dev_dates = sorted(df[df["ap_serial"] == sel_dev4]["date"].dt.date.unique())
             sel_date4 = st.selectbox("Select Date", dev_dates, key="shap_date")
@@ -256,8 +245,8 @@ with tab_shap_device:
             explanation_single = shap.Explanation(
                 values=row[shap_cols].values.astype(float),
                 base_values=float(row["shap_base_value"]),
-                data=row[feature_cols].values.astype(float),
-                feature_names=feature_cols,
+                data=row[FEATURE_COLS].values.astype(float),
+                feature_names=FEATURE_COLS,
             )
             shap.plots.waterfall(explanation_single, show=False)
             fig_wf = plt.gcf()
